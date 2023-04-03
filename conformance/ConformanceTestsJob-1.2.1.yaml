@@ -2,43 +2,43 @@
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: conformance-output-data-1-1
+  name: conformance-output-data-1-2-1
 spec:
   accessModes:
     - ReadWriteMany
   resources:
     requests:
       storage: 1Gi
-  storageClassName: openebs-kernel-nfs-scw
 
 ---
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: conformance-tests-1-1
+  name: conformance-tests-1-2-1
 spec:
   backoffLimit: 0
   template:
     spec:
       initContainers:
-      - name: prep-1-1
+      - name: prep-1-2-1
         image: alpine:3.10
         command: ["chmod", "777", "/output"]
         volumeMounts:
         - mountPath: /output
-          name: conformance-output-data-1-1
+          name: conformance-output-data-1-2-1
       containers:
-      - name: tests-1-1
+      - name: tests-1-2-1
         image: terradue/calrissian:conformance
-        workingDir: "/conformance/cwl-v1.1-1.1.0"
+        workingDir: "/conformance/cwl-v1.2-1.2.1_proposed"
         command: ["cwltest"]
         args:
         - "--test"
-        - "/conformance/cwl-v1.1-1.1.0/conformance_tests.yaml"
+        - "/conformance/cwl-v1.2-1.2.1_proposed/conformance_tests.yaml"
         - "--tool"
         - "calrissian"
         - "--badgedir"
-        - "/output/badges-1.1.0"
+        - "/output/badges-1.2.1_proposed"
+        - "--verbose"
         - "--"
         - "--max-ram"
         - "8G"
@@ -55,16 +55,16 @@ spec:
           value: "/output"
         volumeMounts:
         - mountPath: /conformance
-          name: conformance-test-data-1-1
+          name: conformance-test-data-1-2-1
           readOnly: true
         - mountPath: /output
-          name: conformance-output-data-1-1
+          name: conformance-output-data-1-2-1
       restartPolicy: Never
       volumes:
-      - name: conformance-test-data-1-1
+      - name: conformance-test-data-1-2-1
         persistentVolumeClaim:
-          claimName: conformance-test-data-1-1
+          claimName: conformance-test-data-1-2-1
           readOnly: true
-      - name: conformance-output-data-1-1
+      - name: conformance-output-data-1-2-1
         persistentVolumeClaim:
-          claimName: conformance-output-data-1-1
+          claimName: conformance-output-data-1-2-1
