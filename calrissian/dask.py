@@ -1,8 +1,10 @@
 import os
 import logging
 import yaml
+import threading
 
 from typing import List, Optional, Union
+from datetime import datetime
 
 from kubernetes import client, watch
 from kubernetes.client.rest import ApiException
@@ -369,12 +371,14 @@ class KubernetesDaskClient(KubernetesClient):
             monitor.add(pod)
             self._set_pod(pod)
 
+    @staticmethod
+    def format_log_entry(pod_name, log_entry):
+        return {"timestamp": f"{datetime.utcnow().isoformat()}Z", "pod": pod_name, "entry": log_entry}
 
     @retry_exponential_if_exception_type((ApiException, HTTPError,), log)
-    def follow_logs(self, status=None):
+    def follow_logs(self, status):
         pod_name = self.pod.metadata.name
-
-        log.info('[{}] follow_logs start'.format(pod_name))
+        log.info('[%s] follow_logs start', pod_name)
 
         kwargs = {
             "follow": True,
@@ -383,81 +387,141 @@ class KubernetesDaskClient(KubernetesClient):
         if status is not None:
             kwargs["container"] = status.name
 
-        for line in self.core_api_instance.read_namespaced_pod_log(self.pod.metadata.name, self.namespace, **kwargs).stream():
-            # .stream() is only available if _preload_content=False
-            # .stream() returns a generator, each iteration yields bytes.
-            # kubernetes-client decodes them as utf-8 when _preload_content is True
-            # https://github.com/kubernetes-client/python/blob/fcda6fe96beb21cd05522c17f7f08c5a7c0e3dc3/kubernetes/client/rest.py#L215-L216
-            # So we do the same here
-            if status is not None and not status.state.running:
-                break
+        resp = self.core_api_instance.read_namespaced_pod_log(
+            name=pod_name,
+            namespace=self.namespace,
+            timestamps=False,
+            tail_lines=200,
+            **kwargs
+        )
 
-            line = line.decode('utf-8', errors="ignore").rstrip()
-            log.debug('[{}] {}'.format(pod_name, line))
-            self.tool_log.append(self.format_log_entry(pod_name, line))
-        
-        log.info('[{}] follow_logs end'.format(pod_name))
+        try:
+            for raw in resp.stream():
+                if self._log_stop.is_set():
+                    break
 
+                if status is not None and not status.state.running:
+                    break
+
+                line = raw.decode("utf-8", errors="ignore").rstrip()
+                log.debug('[%s] %s', pod_name, line)
+                self.tool_log.append(self.format_log_entry(pod_name, line))
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+            log.info('[%s] follow_logs end', pod_name)
+
+    def _ensure_log_thread_started(self, status):
+        if self._logs_started:
+            return
+        self._logs_started = True
+        self._log_stop.clear()
+        self._log_thread = threading.Thread(target=self.follow_logs, name="pod-log-follower",  args=(status), daemon=True)
+        self._log_thread.start()
+
+    def _stop_log_thread(self):
+        self._log_stop.set()
+        t = self._log_thread
+        if t and t.is_alive():
+            t.join(timeout=5)
 
     @retry_exponential_if_exception_type((ApiException, HTTPError, IncompleteStatusException), log)
     def wait_for_completion(self, cm_name: str=None) -> CompletionResult:
-        w = watch.Watch()
-        for event in w.stream(self.core_api_instance.list_namespaced_pod, self.namespace, field_selector=self._get_pod_field_selector()):
-            pod = event['object']
 
-            init_status = self.get_list_or_none(pod.status.init_container_statuses)
-            if init_status and self.state_is_terminated(init_status[0].state):
-                init_status_code = init_status[0].state.terminated.exit_code
-                if init_status_code is not None and init_status_code != 0:
-                    with DaskPodMonitor() as monitor:
-                        self.delete_pod_name(pod.metadata.name)
-                        self.delete_configmap_name(cm_name=cm_name)
-                        monitor.remove(pod)
-                    self._clear_pod()
-                    w.stop()
+        resource_version = None
+
+        while True:
+            try:
+                w = watch.Watch()
+
+                pod_list = self.core_api_instance.list_namespaced_pod(
+                    self.namespace, 
+                    field_selector=self._get_pod_field_selector(),
+                    limit = 1
+                )
+
+                if pod_list.items:
+                    resource_version = pod_list.metadata.resource_version
+                
+                for event in w.stream(
+                    func=self.core_api_instance.list_namespaced_pod,
+                    namespace=self.namespace,
+                    field_selector=self._get_pod_field_selector(),
+                    resource_version=resource_version,
+                    timeout_seconds=30
+                ):
+                    pod = event['object']
+                    resource_version = pod.metadata.resource_version
+
+                    init_status = self.get_list_or_none(pod.status.init_container_statuses)
+                    log.info("pod %s uid=%s status=%s", pod.metadata.name, pod.metadata.uid, init_status)
+                    if init_status and self.state_is_terminated(init_status[0].state):
+                        init_status_code = init_status[0].state.terminated.exit_code
+                        if init_status_code is not None and init_status_code != 0:
+                            with DaskPodMonitor() as monitor:
+                                self.delete_pod_name(pod.metadata.name)
+                                self.delete_configmap_name(cm_name=cm_name)
+                                monitor.remove(pod)
+                            self._clear_pod()
+                            w.stop()
+
+                    last_status = self.get_last_or_none(pod.status.container_statuses)    
+                    if last_status is None or not self.state_is_terminated(last_status.state):
+                        statuses = self.get_list_or_none(pod.status.container_statuses)
+                        if statuses is None:
+                            continue
+                        for status in statuses:
+                            log.info("pod %s uid=%s status=%s", pod.metadata.name, pod.metadata.uid, status)
+                            
+                            if status is None:
+                                continue
+                            
+                            elif self.state_is_waiting(status.state):
+                                continue
+
+                            elif self.state_is_running(status.state):
+                                self._ensure_log_thread_started(status)
+                                continue
+
+                            elif self.state_is_terminated(status.state):
+                                continue
+
+                            else:
+                                raise CalrissianJobException('Unexpected pod container status', status)
+                    
+                    if self.state_is_terminated(last_status.state):
+                        log.info("Handling terminated pod %s uid=%s", pod.metadata.name, pod.metadata.uid)
+
+                        self._stop_log_thread()
+
+                        container = self.get_container_by_name(pod.spec.containers, 'main-container')
+                        if container is None:
+                            raise CalrissianJobException("Container 'main-container' not found in pod spec", pod)
+                        
+                        node_selectors = self._get_pod_node_selector()
+                        self._handle_completion(last_status.state, container, node_selectors)
+
+                        if self.should_delete_pod():
+                            with DaskPodMonitor() as monitor:
+                                self.delete_pod_name(pod.metadata.name)
+                                self.delete_configmap_name(cm_name=cm_name)
+                                monitor.remove(pod)
+                        
+                        self._clear_pod()
+                        w.stop()
+
+                if self.completion_result is None:
+                    raise IncompleteStatusException
+                return self.completion_result
             
-            last_status = self.get_last_or_none(pod.status.container_statuses)
-            if last_status is None or not self.state_is_terminated(last_status.state):
-                statuses = self.get_list_or_none(pod.status.container_statuses)
-                if statuses is None:
+            except ApiException as e:
+                if e.status == 410:
+                    log.warning("Watch expired (410 Gone). Re-listing and restarting watch.")
+                    resource_version = None
                     continue
-                for status in statuses:
-                    log.info('pod name {} with id {} has status {}'.format(pod.metadata.name, pod.metadata.uid, status))
-                    if status is None:
-                        continue
-                    if self.state_is_waiting(status.state):
-                        continue
-                    elif self.state_is_running(status.state):
-                        # Can only get logs once container is running
-                        self.follow_logs(status) # This will not return until container completes
-                    elif self.state_is_terminated(status.state):
-                        continue
-                    else:
-                        raise CalrissianJobException('Unexpected pod container status', status)
-            elif self.state_is_terminated(last_status.state):
-                log.info('Handling terminated pod name {} with id {}'.format(pod.metadata.name, pod.metadata.uid))
-                container = self.get_container_by_name(pod.spec.containers, 'main-container')
-                if container is None:
-                    raise CalrissianJobException("Container 'main-container' not found in pod spec", pod)
-                node_selectors = self._get_pod_node_selector()
-                self._handle_completion(last_status.state, container, node_selectors)
-                if self.should_delete_pod():
-                    with DaskPodMonitor() as monitor:
-                        self.delete_pod_name(pod.metadata.name)
-                        self.delete_configmap_name(cm_name=cm_name)
-                        monitor.remove(pod)
-                self._clear_pod()
-                # stop watching for events, our pod is done. Causes wait loop to exit
-                w.stop()
-            else:
-                raise CalrissianJobException('Unexpected pod container status', last_status)
-        
-        # When the pod is done we should have a completion result
-        # Otherwise it will lead to further exceptions
-        if self.completion_result is None:
-            raise IncompleteStatusException
-        
-        return self.completion_result
+                raise
     
     @staticmethod
     def get_list_or_none(container_list: Optional[List[Union[V1ContainerStatus, V1Container]]]) -> Optional[Union[V1ContainerStatus, V1Container]]:

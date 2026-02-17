@@ -529,25 +529,38 @@ class KubernetesDaskClientTestCase(TestCase):
     @patch('calrissian.dask.watch', autospec=True)
     def test_wait_calls_watch_pod_with_pod_name_field_selector(self, mock_watch, mock_get_namespace, mock_client):
         mock_pod = self.make_mock_pod('test123')
-
+    
         mock_pod.status = Mock()
         mock_pod.status.init_container_statuses = None
         mock_pod.status.container_statuses = [Mock()]
-
+    
         mock_pod.spec = Mock()
         mock_pod.spec.containers = [self.make_mock_container("main-container")]
-
-        mock_pod.status.container_statuses[0].state = Mock(running=None, waiting=None, terminated=Mock(exit_code=0))
-        
+    
+        mock_pod.status.container_statuses[0].state = Mock(
+            running=None, waiting=None, terminated=Mock(exit_code=0)
+        )
+    
         self.setup_mock_watch(mock_watch, [mock_pod])
-
+    
         kc = KubernetesDaskClient()
         kc._set_pod(mock_pod)
         kc.wait_for_completion(cm_name='dask-cm-random')
+    
         mock_stream = mock_watch.Watch.return_value.stream
-        self.assertEqual(mock_stream.call_args, call(kc.core_api_instance.list_namespaced_pod, kc.namespace,
-                                                     field_selector='metadata.name=test123'))
-
+    
+        expected_rv = kc.core_api_instance.list_namespaced_pod.return_value.metadata.resource_version
+    
+        self.assertEqual(
+            mock_stream.call_args,
+            call(
+                func=kc.core_api_instance.list_namespaced_pod,
+                namespace=kc.namespace,
+                field_selector='metadata.name=test123',
+                resource_version=expected_rv,
+                timeout_seconds=30,
+            ),
+        )
 
     @patch('calrissian.dask.watch', autospec=True)
     def test_wait_calls_watch_pod_with_incomplete_status(self, mock_watch, mock_get_namespace, mock_client):

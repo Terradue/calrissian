@@ -93,8 +93,18 @@ class KubernetesClientTestCase(TestCase):
         kc._set_pod(mock_pod)
         kc.wait_for_completion()
         mock_stream = mock_watch.Watch.return_value.stream
-        self.assertEqual(mock_stream.call_args, call(kc.core_api_instance.list_namespaced_pod, kc.namespace,
-                                                     field_selector='metadata.name=test123'))
+        expected_rv = kc.core_api_instance.list_namespaced_pod.return_value.metadata.resource_version
+
+        self.assertEqual(
+            mock_stream.call_args,
+            call(
+                func=kc.core_api_instance.list_namespaced_pod,
+                namespace=kc.namespace,
+                field_selector='metadata.name=test123',
+                resource_version=expected_rv,
+                timeout_seconds=30,
+            ),
+        )
     @patch('calrissian.k8s.watch', autospec=True)
     def test_wait_calls_watch_pod_with_imcomplete_status(self, mock_watch, mock_get_namespace, mock_client):
         self.setup_mock_watch(mock_watch)
@@ -193,7 +203,7 @@ class KubernetesClientTestCase(TestCase):
         self.setup_mock_watch(mock_watch, [mock_pod])
         kc = KubernetesClient()
         kc._set_pod(Mock())
-        with self.assertRaisesRegex(CalrissianJobException, 'Unexpected pod container status'):
+        with self.assertRaises(IncompleteStatusException):
             kc.wait_for_completion()
 
     def test_raises_on_set_second_pod(self, mock_get_namespace, mock_client):
@@ -276,15 +286,17 @@ class KubernetesClientTestCase(TestCase):
         mock_log.reset_mock() # log will have other calls before calling follow_logs()
         kc.follow_logs()
         self.assertTrue(mock_read.called)
-        self.assertEqual(mock_read.call_args, call('logging-pod-123', 'logging-ns',
-                                                   follow=True, _preload_content=False))
+        self.assertEqual(mock_read.call_args, call(name='logging-pod-123', namespace='logging-ns',
+                                                   follow=True, _preload_content=False,
+                                                   timestamps=False, tail_lines=200))
         self.assertEqual(mock_log.debug.mock_calls, [
-            call('[logging-pod-123] line1'),
-            call('[logging-pod-123] line2')
-            ])
+            call('[%s] %s', 'logging-pod-123', 'line1'),
+            call('[%s] %s', 'logging-pod-123', 'line2')
+            ]
+        )
         self.assertEqual(mock_log.info.mock_calls, [
-            call('[logging-pod-123] follow_logs start'),
-            call('[logging-pod-123] follow_logs end')
+            call('[%s] follow_logs start', 'logging-pod-123'),
+            call('[%s] follow_logs end', 'logging-pod-123')
         ])
 
 
