@@ -241,6 +241,11 @@ class KubernetesPodBuilder(object):
         self.requirements = {} if self.builder.requirements is None else self.builder.requirements
         self.hints = [] if self.builder.hints is None else self.builder.hints
 
+        log.info("SELF.REQUIREMENTS")
+        log.info(self.requirements)
+        log.info("SELF.HINTS")
+        log.info(self.hints)
+
     def pod_name(self):
         tag = random_tag()
         return k8s_safe_name('{}-pod-{}'.format(self.name, tag))
@@ -414,6 +419,10 @@ class KubernetesPodBuilder(object):
                 'class' in req
                 and req['class'] in ['cwltool:CUDARequirement', 'http://commonwl.org/cwltool#CUDARequirement']
                 for req in self.requirements
+            ) or any(
+                'class' in req
+                and req['class'] in ['cwltool:CUDARequirement', 'http://commonwl.org/cwltool#CUDARequirement']
+                for req in self.hints
             )
             else _tostring(self.nodeselectors)
         )
