@@ -241,11 +241,6 @@ class KubernetesPodBuilder(object):
         self.requirements = {} if self.builder.requirements is None else self.builder.requirements
         self.hints = [] if self.builder.hints is None else self.builder.hints
 
-        log.info("SELF.REQUIREMENTS")
-        log.info(self.requirements)
-        log.info("SELF.HINTS")
-        log.info(self.hints)
-
     def pod_name(self):
         tag = random_tag()
         return k8s_safe_name('{}-pod-{}'.format(self.name, tag))
