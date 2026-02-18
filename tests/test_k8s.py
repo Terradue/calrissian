@@ -83,6 +83,23 @@ class KubernetesClientTestCase(TestCase):
         type(mock_metadata).name = name_property
         mock_pod = create_autospec(V1Pod, metadata=mock_metadata)
         return mock_pod
+    
+    def make_mock_pod_with_state(self, name, *, running=False, waiting=False, terminated=False, exit_code=0):
+        pod = self.make_mock_pod(name)
+
+        cs = Mock()
+        cs.state = Mock(
+            waiting=Mock() if waiting else None,
+            running=Mock() if running else None,
+            terminated=Mock(exit_code=exit_code) if terminated else None,
+        )
+        pod.status.container_statuses = [cs]
+
+        container = Mock()
+        container.resources = Mock()
+        container.resources.requests = {"cpu": "1", "memory": "1Gi"}  # strings like real k8s quantities
+        pod.spec.containers = [container]
+        return pod
 
     @patch('calrissian.k8s.watch', autospec=True)
     def test_wait_calls_watch_pod_with_pod_name_field_selector(self, mock_watch, mock_get_namespace, mock_client):
@@ -107,53 +124,91 @@ class KubernetesClientTestCase(TestCase):
         )
     @patch('calrissian.k8s.watch', autospec=True)
     def test_wait_calls_watch_pod_with_imcomplete_status(self, mock_watch, mock_get_namespace, mock_client):
-        self.setup_mock_watch(mock_watch)
         mock_pod = self.make_mock_pod('test123')
+
+        status = Mock()
+        status.state = Mock(waiting=None, running=None, terminated=Mock(exit_code=0)        )
+        mock_pod.status.container_statuses = [status]
+        self.setup_mock_watch(mock_watch, [mock_pod])
+
         kc = KubernetesClient()
         kc._set_pod(mock_pod)
+        kc._handle_completion = Mock(return_value=None)
+
         # Assert IncompleteStatusException is raised
         with self.assertRaises(IncompleteStatusException):
             kc.wait_for_completion()
 
     @patch('calrissian.k8s.watch', autospec=True)
     def test_wait_skips_pod_when_status_is_none(self, mock_watch, mock_get_namespace, mock_client):
-        mock_pod = Mock(status=Mock(container_statuses=None))
-        self.setup_mock_watch(mock_watch, [mock_pod])
+        class StopTest(Exception):
+            pass
+        
+        mock_pod = Mock()
+        mock_pod.metadata = Mock()
+        mock_pod.metadata.name = "test123"
+        mock_pod.metadata.uid = "u1"
+        mock_pod.metadata.resource_version = "1"
+
+        mock_pod.status = Mock()
+        mock_pod.status.container_statuses = None
+
+        mock_pod.spec = Mock()
+        mock_pod.spec.containers = []
+
+        w = mock_watch.Watch.return_value
+        w.stop = Mock()
+
+        def gen():
+            yield {"object": mock_pod}
+            raise StopTest()
+
+        w.stream.side_effect = lambda **kwargs: gen()
+
         kc = KubernetesClient()
-        kc._set_pod(Mock())
-        with self.assertRaises(IncompleteStatusException):
+        kc._set_pod(mock_pod)
+
+        with self.assertRaises(StopTest):
             kc.wait_for_completion()
-        self.assertFalse(mock_watch.Watch.return_value.stop.called)
+
+        self.assertFalse(w.stop.called)
         self.assertFalse(mock_client.CoreV1Api.return_value.delete_namespaced_pod.called)
         self.assertIsNotNone(kc.pod)
 
     @patch('calrissian.k8s.watch', autospec=True)
     def test_wait_skips_pod_when_state_is_waiting(self, mock_watch, mock_get_namespace, mock_client):
-        mock_pod = create_autospec(V1Pod)
-        mock_pod.status.container_statuses[0].state = Mock(running=None, waiting=True, terminated=None)
-        self.setup_mock_watch(mock_watch, [mock_pod])
+        waiting_pod = self.make_mock_pod_with_state("test123", waiting=True)
+        terminated_pod = self.make_mock_pod_with_state("test123", terminated=True, exit_code=0)
+
+        self.setup_mock_watch(mock_watch, [waiting_pod, terminated_pod])
+
         kc = KubernetesClient()
-        kc._set_pod(Mock())
-        with self.assertRaises(IncompleteStatusException):
-            kc.wait_for_completion()
-        self.assertFalse(mock_watch.Watch.return_value.stop.called)
+        kc._set_pod(waiting_pod)
+
+        kc._handle_completion = Mock(side_effect=lambda *a, **k: setattr(kc, "completion_result", Mock()))
+        kc.should_delete_pod = Mock(return_value=False)
+        kc.wait_for_completion()
+
+        self.assertTrue(mock_watch.Watch.return_value.stop.called)
         self.assertFalse(mock_client.CoreV1Api.return_value.delete_namespaced_pod.called)
-        self.assertIsNotNone(kc.pod)
 
     @patch('calrissian.k8s.watch', autospec=True)
-    @patch('calrissian.k8s.KubernetesClient.follow_logs')
-    def test_wait_follows_logs_pod_when_state_is_running(self, mock_follow_logs, mock_watch, mock_get_namespace, mock_client):
-        mock_pod = create_autospec(V1Pod)
-        mock_pod.status.container_statuses[0].state = Mock(running=True, waiting=None, terminated=None)
-        self.setup_mock_watch(mock_watch, [mock_pod])
+    def test_wait_follows_logs_pod_when_state_is_running(self, mock_watch, mock_get_namespace, mock_client):
+        running_pod = self.make_mock_pod_with_state("test123", running=True)
+        terminated_pod = self.make_mock_pod_with_state("test123", terminated=True, exit_code=0)
+
+        self.setup_mock_watch(mock_watch, [running_pod, terminated_pod])
+
         kc = KubernetesClient()
-        kc._set_pod(Mock())
-        with self.assertRaises(IncompleteStatusException):
-            kc.wait_for_completion()
-        self.assertFalse(mock_watch.Watch.return_value.stop.called)
-        self.assertFalse(mock_client.CoreV1Api.return_value.delete_namespaced_pod.called)
-        self.assertIsNotNone(kc.pod)
-        self.assertTrue(mock_follow_logs.called)
+        kc._set_pod(running_pod)
+        kc._ensure_log_thread_started = Mock()
+        kc._stop_log_thread = Mock()
+        kc.completion_result = Mock()
+
+        kc.wait_for_completion()
+
+        kc._ensure_log_thread_started.assert_called()
+        kc._stop_log_thread.assert_called()
 
     @patch('calrissian.k8s.watch', autospec=True)
     @patch('calrissian.k8s.PodMonitor')
@@ -198,11 +253,14 @@ class KubernetesClientTestCase(TestCase):
 
     @patch('calrissian.k8s.watch', autospec=True)
     def test_wait_raises_exception_when_state_is_unexpected(self, mock_watch, mock_get_namespace, mock_client):
-        mock_pod = create_autospec(V1Pod)
-        mock_pod.status.container_statuses[0].state = Mock(running=None, waiting=None, terminated=None)
+        mock_pod = self.make_mock_pod('test123')
+        cs = Mock()
+        cs.state = Mock(running=None, waiting=None, terminated=None)
+        mock_pod.status.container_statuses = [cs]
         self.setup_mock_watch(mock_watch, [mock_pod])
         kc = KubernetesClient()
-        kc._set_pod(Mock())
+        kc._set_pod(mock_pod)
+
         with self.assertRaises(IncompleteStatusException):
             kc.wait_for_completion()
 

@@ -185,9 +185,10 @@ class KubernetesClient(object):
         t = self._log_thread
         if t and t.is_alive():
             t.join(timeout=5)
+        self._log_thread = None
+        self._logs_started = False
 
-    
-    @retry_exponential_if_exception_type((ApiException, HTTPError, IncompleteStatusException), log)
+    @retry_exponential_if_exception_type((ApiException, HTTPError), log)
     def wait_for_completion(self) -> CompletionResult:
         resource_version = None
 
@@ -204,6 +205,8 @@ class KubernetesClient(object):
                 if pod_list.items:
                     resource_version = pod_list.metadata.resource_version
                 
+                events_seen = False
+
                 for event in w.stream(
                     func=self.core_api_instance.list_namespaced_pod,
                     namespace=self.namespace,
@@ -211,6 +214,7 @@ class KubernetesClient(object):
                     resource_version=resource_version,
                     timeout_seconds=30
                 ):
+                    events_seen = True
                     pod = event["object"]
                     resource_version = pod.metadata.resource_version
 
@@ -244,9 +248,21 @@ class KubernetesClient(object):
                         self._clear_pod()
                         w.stop()
 
-                if self.completion_result is None:
+                        if self.completion_result is None:
+                            raise IncompleteStatusException
+                        return self.completion_result
+                    
+                    log.warning(
+                        "Unexpected container state for pod %s uid=%s: %s",
+                        pod.metadata.name,
+                        pod.metadata.uid,
+                        status.state,
+                    )
+                    w.stop()
                     raise IncompleteStatusException
-                return self.completion_result
+
+                if not events_seen:
+                    continue
 
             except ApiException as e:
                 if e.status == 410:

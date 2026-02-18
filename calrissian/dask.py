@@ -426,8 +426,10 @@ class KubernetesDaskClient(KubernetesClient):
         t = self._log_thread
         if t and t.is_alive():
             t.join(timeout=5)
+        self._log_thread = None
+        self._logs_started = False
 
-    @retry_exponential_if_exception_type((ApiException, HTTPError, IncompleteStatusException), log)
+    @retry_exponential_if_exception_type((ApiException, HTTPError), log)
     def wait_for_completion(self, cm_name: str=None) -> CompletionResult:
 
         resource_version = None
@@ -445,6 +447,8 @@ class KubernetesDaskClient(KubernetesClient):
                 if pod_list.items:
                     resource_version = pod_list.metadata.resource_version
                 
+                events_seen = False
+                
                 for event in w.stream(
                     func=self.core_api_instance.list_namespaced_pod,
                     namespace=self.namespace,
@@ -452,6 +456,7 @@ class KubernetesDaskClient(KubernetesClient):
                     resource_version=resource_version,
                     timeout_seconds=30
                 ):
+                    events_seen = True
                     pod = event['object']
                     resource_version = pod.metadata.resource_version
 
@@ -474,22 +479,24 @@ class KubernetesDaskClient(KubernetesClient):
                             continue
                         for status in statuses:
                             log.info("pod %s uid=%s status=%s", pod.metadata.name, pod.metadata.uid, status)
-                            
+
                             if status is None:
                                 continue
-                            
-                            elif self.state_is_waiting(status.state):
+
+                            if self.state_is_waiting(status.state):
                                 continue
 
-                            elif self.state_is_running(status.state):
+                            if self.state_is_running(status.state):
                                 self._ensure_log_thread_started(status)
                                 continue
 
-                            elif self.state_is_terminated(status.state):
+                            if self.state_is_terminated(status.state):
                                 continue
 
-                            else:
-                                raise CalrissianJobException('Unexpected pod container status', status)
+                            w.stop()
+                            raise CalrissianJobException("Unexpected pod container status", status)
+
+                        continue
                     
                     if self.state_is_terminated(last_status.state):
                         log.info("Handling terminated pod %s uid=%s", pod.metadata.name, pod.metadata.uid)
@@ -511,10 +518,14 @@ class KubernetesDaskClient(KubernetesClient):
                         
                         self._clear_pod()
                         w.stop()
+                        
 
-                if self.completion_result is None:
-                    raise IncompleteStatusException
-                return self.completion_result
+                        if self.completion_result is None:
+                            raise IncompleteStatusException
+                        return self.completion_result
+
+                if not events_seen:
+                    continue
             
             except ApiException as e:
                 if e.status == 410:
