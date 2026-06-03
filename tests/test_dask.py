@@ -45,7 +45,16 @@ class KubernetesDaskPodBuilderTestCase(TestCase):
         builder = Mock()
         builder.cwlVersion = "v1.2"
         builder.requirements = []
+        builder.hints = []
         builder.resources = {'cores': 1, 'ram': 1024}
+        self.dask_requirement: CWLObjectType = {
+            "workerCores": 2,
+            "workerCoresLimit": 2,
+            "workerMemory": "4G",
+            "clusterMaxCores": 8,
+            "clusterMaxMemory": "16G",
+            "class": "https://calrissian-cwl.github.io/schema#DaskGatewayRequirement" # From cwl
+        }
         self.name = 'PodName'
         self.builder = builder
         self.container_image = 'dockerimage:1.0'
@@ -73,14 +82,17 @@ class KubernetesDaskPodBuilderTestCase(TestCase):
                                                     self.environment, self.volume_mounts, self.volumes, self.command_line, self.stdout, self.stderr,
                                                     self.stdin, self.labels, self.nodeselectors, self.gpu_nodeselectors, self.security_context, self.pod_serviceaccount,
                                                     self.pod_additional_spec, self.no_network_access_pod_labels, self.network_access_pod_labels )
-        self.pod_builder.dask_requirement = {
-            "workerCores": 2,
-            "workerCoresLimit": 2,
-            "workerMemory": "4G",
-            "clusterMaxCores": 8,
-            "clusterMaxMemory": "16G",
-            "class": "https://calrissian-cwl.github.io/schema#DaskGatewayRequirement" # From cwl
-        }
+        self.pod_builder.dask_requirement = self.dask_requirement
+
+    def test_uses_dask_requirement_from_hints(self):
+        self.builder.hints = [self.dask_requirement]
+
+        pod_builder = KubernetesDaskPodBuilder(self.dask_gateway_url, self.dask_gateway_controller, self.name, self.builder, self.container_image,
+                                               self.environment, self.volume_mounts, self.volumes, self.command_line, self.stdout, self.stderr,
+                                               self.stdin, self.labels, self.nodeselectors, self.gpu_nodeselectors, self.security_context, self.pod_serviceaccount,
+                                               self.pod_additional_spec, self.no_network_access_pod_labels, self.network_access_pod_labels )
+
+        self.assertEqual(self.dask_requirement, pod_builder.dask_requirement)
 
     def test_main_container_args_without_redirects(self):
         # container_args returns a list with a single item since it is passed to 'sh', '-c'
