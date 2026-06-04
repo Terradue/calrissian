@@ -45,7 +45,16 @@ class KubernetesDaskPodBuilderTestCase(TestCase):
         builder = Mock()
         builder.cwlVersion = "v1.2"
         builder.requirements = []
+        builder.hints = []
         builder.resources = {'cores': 1, 'ram': 1024}
+        self.dask_requirement: CWLObjectType = {
+            "workerCores": 2,
+            "workerCoresLimit": 2,
+            "workerMemory": "4G",
+            "clusterMaxCores": 8,
+            "clusterMaxMemory": "16G",
+            "class": "https://calrissian-cwl.github.io/schema#DaskGatewayRequirement" # From cwl
+        }
         self.name = 'PodName'
         self.builder = builder
         self.container_image = 'dockerimage:1.0'
@@ -73,14 +82,53 @@ class KubernetesDaskPodBuilderTestCase(TestCase):
                                                     self.environment, self.volume_mounts, self.volumes, self.command_line, self.stdout, self.stderr,
                                                     self.stdin, self.labels, self.nodeselectors, self.gpu_nodeselectors, self.security_context, self.pod_serviceaccount,
                                                     self.pod_additional_spec, self.no_network_access_pod_labels, self.network_access_pod_labels )
-        self.pod_builder.dask_requirement = {
-            "workerCores": 2,
-            "workerCoresLimit": 2,
-            "workerMemory": "4G",
-            "clusterMaxCores": 8,
-            "clusterMaxMemory": "16G",
-            "class": "https://calrissian-cwl.github.io/schema#DaskGatewayRequirement" # From cwl
-        }
+        self.pod_builder.dask_requirement = self.dask_requirement
+
+    def test_uses_dask_requirement_from_hints(self):
+        self.builder.hints = [self.dask_requirement]
+
+        pod_builder = KubernetesDaskPodBuilder(self.dask_gateway_url, self.dask_gateway_controller, self.name, self.builder, self.container_image,
+                                               self.environment, self.volume_mounts, self.volumes, self.command_line, self.stdout, self.stderr,
+                                               self.stdin, self.labels, self.nodeselectors, self.gpu_nodeselectors, self.security_context, self.pod_serviceaccount,
+                                               self.pod_additional_spec, self.no_network_access_pod_labels, self.network_access_pod_labels )
+
+        self.assertEqual(self.dask_requirement, pod_builder.dask_requirement)
+
+    def test_uses_dask_requirement_from_requirements(self):
+        self.builder.requirements = [self.dask_requirement]
+
+        pod_builder = KubernetesDaskPodBuilder(self.dask_gateway_url, self.dask_gateway_controller, self.name, self.builder, self.container_image,
+                                               self.environment, self.volume_mounts, self.volumes, self.command_line, self.stdout, self.stderr,
+                                               self.stdin, self.labels, self.nodeselectors, self.gpu_nodeselectors, self.security_context, self.pod_serviceaccount,
+                                               self.pod_additional_spec, self.no_network_access_pod_labels, self.network_access_pod_labels )
+
+        self.assertEqual(self.dask_requirement, pod_builder.dask_requirement)
+
+    def test_prefers_dask_requirement_from_requirements_over_hints(self):
+        hint_requirement = dict(self.dask_requirement)
+        hint_requirement["workerMemory"] = "8G"
+        self.builder.requirements = [self.dask_requirement]
+        self.builder.hints = [hint_requirement]
+
+        pod_builder = KubernetesDaskPodBuilder(self.dask_gateway_url, self.dask_gateway_controller, self.name, self.builder, self.container_image,
+                                               self.environment, self.volume_mounts, self.volumes, self.command_line, self.stdout, self.stderr,
+                                               self.stdin, self.labels, self.nodeselectors, self.gpu_nodeselectors, self.security_context, self.pod_serviceaccount,
+                                               self.pod_additional_spec, self.no_network_access_pod_labels, self.network_access_pod_labels )
+
+        self.assertEqual(self.dask_requirement, pod_builder.dask_requirement)
+
+    def test_ignores_malformed_or_unrelated_hints(self):
+        self.builder.hints = [
+            {"class": "https://example.com/schema#OtherRequirement"},
+            {"workerMemory": "8G"},
+        ]
+
+        pod_builder = KubernetesDaskPodBuilder(self.dask_gateway_url, self.dask_gateway_controller, self.name, self.builder, self.container_image,
+                                               self.environment, self.volume_mounts, self.volumes, self.command_line, self.stdout, self.stderr,
+                                               self.stdin, self.labels, self.nodeselectors, self.gpu_nodeselectors, self.security_context, self.pod_serviceaccount,
+                                               self.pod_additional_spec, self.no_network_access_pod_labels, self.network_access_pod_labels )
+
+        self.assertIsNone(pod_builder.dask_requirement)
 
     def test_main_container_args_without_redirects(self):
         # container_args returns a list with a single item since it is passed to 'sh', '-c'
@@ -442,6 +490,62 @@ class CalrissianCommandLineDaskJobTestCase(TestCase):
         # returns that
         self.assertTrue(mock_pod_builder.return_value.build.called)
         self.assertEqual(built, mock_pod_builder.return_value.build.return_value)
+
+    @patch('calrissian.dask.os')
+    @patch('calrissian.job.read_yaml')
+    def test_create_kubernetes_runtime_uses_dask_hint_config_end_to_end(self, mock_read_yaml, mock_os, mock_volume_builder, mock_client):
+        def realpath(path):
+            return '/real' + path
+
+        mock_os.path.realpath = realpath
+        mock_read_yaml.return_value = {}
+        mock_volume_builder.return_value.volume_mounts = []
+        mock_volume_builder.return_value.volumes = []
+        mock_volume_builder.return_value.add_volume_binding = Mock()
+        mock_volume_builder.return_value.add_emptydir_volume = Mock()
+        mock_volume_builder.return_value.add_emptydir_volume_binding = Mock()
+        mock_volume_builder.return_value.add_configmap_volume = Mock()
+        mock_volume_builder.return_value.add_configmap_volume_binding = Mock()
+        mock_client.return_value.get_configmap_from_namespace.return_value = True
+
+        dask_hint = {
+            "workerCores": 2,
+            "workerCoresLimit": 2,
+            "workerMemory": "4G",
+            "clusterMaxCores": 8,
+            "clusterMaxMemory": "16G",
+            "class": "https://calrissian-cwl.github.io/schema#DaskGatewayRequirement"
+        }
+        self.hints = [dask_hint]
+        self.builder.requirements = self.requirements
+        self.builder.hints = self.hints
+        self.builder.resources = {'cores': 1, 'ram': 1024}
+        job = self.make_job()
+        job.outdir = '/outdir'
+        job.tmpdir = '/tmpdir'
+        job.environment = {
+            'HOME': '/homedir',
+            'PYTHONPATH': '/app',
+        }
+        mock_runtime_context = Mock(
+            tmpdir_prefix='TP',
+            pod_serviceaccount=None,
+            pod_priority_class=None,
+            env_from_secret=None,
+            env_from_configmap=None,
+            pod_env_vars=None,
+        )
+
+        built = job.create_kubernetes_runtime(mock_runtime_context)
+
+        main_container_env = built['spec']['containers'][0]['env']
+        init_container_env = built['spec']['initContainers'][0]['env']
+
+        self.assertIn({'name': 'DASK_GATEWAY_WORKER_CORES', 'value': '2'}, main_container_env)
+        self.assertIn({'name': 'DASK_GATEWAY_WORKER_MEMORY', 'value': '4G'}, main_container_env)
+        self.assertIn({'name': 'DASK_GATEWAY_CLUSTER_MAX_CORES', 'value': '8'}, main_container_env)
+        self.assertIn({'name': 'DASK_GATEWAY_CLUSTER_MAX_RAM', 'value': '16G'}, main_container_env)
+        self.assertIn({'name': 'DASK_GATEWAY_WORKER_MEMORY', 'value': '4G'}, init_container_env)
 
     
     @patch('calrissian.dask.KubernetesDaskPodBuilder')

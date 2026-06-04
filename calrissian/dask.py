@@ -35,6 +35,8 @@ from calrissian.k8s import (
 log = logging.getLogger("calrissian.dask")
 log_main = logging.getLogger("calrissian.main")
 
+DASK_GATEWAY_REQUIREMENT = "https://calrissian-cwl.github.io/schema#DaskGatewayRequirement"
+
 
 def dask_req_validate(requirement: Optional[CWLObjectType]) -> bool:
     """
@@ -63,7 +65,14 @@ class KubernetesDaskPodBuilder(KubernetesPodBuilder):
         self.dask_gateway_url = dask_gateway_url
         self.dask_gateway_controller = dask_gateway_controller
     
-        self.dask_requirement = next((elem for elem in self.requirements if elem['class'] == 'https://calrissian-cwl.github.io/schema#DaskGatewayRequirement'), None)
+        self.dask_requirement = next(
+            (
+                elem
+                for elem in list(self.requirements) + list(self.hints)
+                if elem.get('class') == DASK_GATEWAY_REQUIREMENT
+            ),
+            None
+        )
     
 
     def container_args(self):
@@ -100,6 +109,8 @@ class KubernetesDaskPodBuilder(KubernetesPodBuilder):
         for name, value in sorted(self.environment.items()):
             environment.append({'name': name, 'value': value})
         
+        log.debug(self.dask_requirement)
+
         environment.append({'name': 'DASK_GATEWAY_WORKER_CORES', 'value': str(self.dask_requirement.get("workerCores"))})
         environment.append({'name': 'DASK_GATEWAY_WORKER_MEMORY', 'value': str(self.dask_requirement.get("workerMemory"))})
         environment.append({'name': 'DASK_GATEWAY_WORKER_CORES_LIMIT', 'value': str(self.dask_requirement.get("workerCoresLimit"))})
